@@ -1,0 +1,273 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import datetime
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import r2_score
+
+import tensorflow as tf
+from tensorflow.keras import Sequential, layers, utils, losses
+from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import math
+from sklearn import svm
+
+from tensorflow.keras.callbacks import *
+from tensorflow.keras.initializers import *
+from tensorflow.keras.layers import *
+from tensorflow.keras.models import *
+
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# 加载数据集
+dataset = pd.read_csv("BikeShares.csv", parse_dates=['timestamp'], index_col=['timestamp'])
+
+
+# 分别对字段t1, t2, hum, wind_speed进行归一化
+columns = ['cnt', 't1', 't2', 'hum', 'wind_speed']
+
+for col in columns:
+    scaler = MinMaxScaler()
+    dataset[col] = scaler.fit_transform(dataset[col].values.reshape(-1,1))
+    
+    
+# 特征数据集
+X = dataset
+
+# 标签数据集
+y = dataset['cnt']
+
+
+# 1 数据集分离： X_train, X_test
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False, random_state=666)
+
+
+# 2 构造特征数据集
+
+def create_dataset(X, y, seq_len=24):
+    features = []
+    targets = []
+    
+    for i in range(0, len(X) - seq_len, 1):
+        data = X.iloc[i:i+seq_len] # 序列数据
+        label = y.iloc[i+seq_len] # 标签数据
+        # 保存到features和labels
+        features.append(data)
+        targets.append(label)
+    
+    # 返回
+    return np.array(features), np.array(targets)
+    
+  
+# ① 构造训练特征数据集
+train_dataset, train_labels = create_dataset(X_train, y_train, seq_len=24)
+
+
+# ② 构造测试特征数据集
+test_dataset, test_labels = create_dataset(X_test, y_test, seq_len=24)
+
+
+# 3 构造批数据
+def create_batch_dataset(X, y, train=True, buffer_size=1000, batch_size=128):
+    batch_data = tf.data.Dataset.from_tensor_slices((tf.constant(X), tf.constant(y))) # 数据封装，tensor类型
+    if train: # 训练集
+        return batch_data.cache().shuffle(buffer_size).batch(batch_size)
+    else: # 测试集
+        return batch_data.batch(batch_size)
+        
+        
+ # 训练批数据
+train_batch_dataset = create_batch_dataset(train_dataset, train_labels)
+
+
+# 测试批数据
+test_batch_dataset = create_batch_dataset(test_dataset, test_labels, train=False)
+
+
+class SQLstmCell(tf.keras.layers.Layer):
+    def __init__(self, units, **kwargs):
+        super(SQLstmCell, self).__init__(**kwargs)
+        # lstm 维度
+        self.units = units
+
+    def build(self, input_shape):
+        input_dim = input_shape[-1]
+
+        # trainable_variables
+        self.lstm_w = self.add_weight(shape=(input_dim, self.units * 4), name='kernel', initializer='glorot_uniform')
+        self.lstm_u = self.add_weight(shape=(self.units, self.units * 4), name='recurrent_kernel', initializer='orthogonal')
+        self.lstm_b = self.add_weight(shape=(self.units * 4), name='bias', initializer='zeros')
+
+        # activations
+        self.lstm_activation = activations.get('tanh')
+
+    def call(self, inputs, states_tm1):
+        h_tm1, c_tm1 = states_tm1
+        w_i, w_f, w_c, w_o = tf.split(self.lstm_w, num_or_size_splits=4, axis=1)
+        u_i, u_f, u_c, u_o = tf.split(self.lstm_u, num_or_size_splits=4, axis=1)
+        b_i, b_f, b_c, b_o = tf.split(self.lstm_b, num_or_size_splits=4, axis=0)
+        # w x
+        wx_i = tf.matmul(inputs, w_i)
+        wx_f = tf.matmul(inputs, w_f)
+        wx_c = tf.matmul(inputs, w_c)
+        wx_o = tf.matmul(inputs, w_o)
+        # u h
+        uh_i = tf.matmul(h_tm1, u_i)
+        uh_f = tf.matmul(h_tm1, u_f)
+        uh_c = tf.matmul(h_tm1, u_c)
+        uh_o = tf.matmul(h_tm1, u_o)
+        # w x + u * h + b
+        i_t = wx_i + uh_i + b_i
+        f_t = wx_f + uh_f + b_f
+        c_t = wx_c + uh_c + b_c
+        o_t = wx_o + uh_o + b_o
+        
+        i = self.lstm_activation(i_t)
+        f = self.lstm_activation(f_t)
+        c = f * c_tm1 + i^2
+        o = self.lstm_activation(o_t)
+        h = o * self.lstm_activation(c)
+        return h, (h, c)
+        
+        
+        
+ class SQLSTM(tf.keras.layers.Layer):
+    def __init__(self, units=128, return_sequences=False):
+        super(SQLSTM, self).__init__()
+        self.units = units
+        self.return_sequences = return_sequences
+        self.cell = SQLstmCell(units)
+
+    def get_init_state(self, inputs):
+        batch_size = tf.shape(inputs)[0]
+        init_h = tf.zeros(shape=[batch_size, self.units])
+        init_c = init_h
+        # get the initial state
+        return (init_h, init_c)
+    
+    @tf.function(experimental_relax_shapes=True)
+    def call(self, inputs):
+        # set time step as the first dimension
+        inputs = tf.transpose(inputs, perm=[1, 0, 2])
+        state = self.get_init_state(inputs[0])
+        hidden_seq = tf.TensorArray(dtype=tf.float32, size=tf.shape(inputs)[0])
+        for time_step in tf.range(tf.shape(inputs)[0]):
+            h, state = self.cell(inputs[time_step], state)
+            hidden_seq = hidden_seq.write(time_step, h)
+
+        hidden_seq = hidden_seq.stack()
+        last_hidden = hidden_seq[-1]
+        hidden_seq = tf.transpose(hidden_seq, perm=[1, 0, 2])
+        ret = tf.case([(tf.constant(self.return_sequences), lambda: hidden_seq)], default=lambda: last_hidden)
+        return ret
+        
+        
+        
+def attention_3d_block(inputs):
+    # inputs.shape = (batch_size, time_steps, input_dim)
+    input_dim = int(inputs.shape[2])
+    a = inputs
+    #a = Permute((2, 1))(inputs)
+    #a = Reshape((input_dim, TIME_STEPS))(a) # this line is not useful. It's just to know which dimension is what.
+    a = Dense(input_dim, activation='softmax')(a)
+    if SINGLE_ATTENTION_VECTOR:
+        a = Lambda(lambda x: K.mean(x, axis=1), name='dim_reduction')(a)
+        a = RepeatVector(input_dim)(a)
+    a_probs = Permute((1, 2), name='attention_vec')(a)
+ 
+    output_attention_mul = multiply([inputs, a_probs], name='attention_mul')
+    return output_attention_mul
+    
+    
+    
+def attention_model():
+    inputs = Input(shape=(TIME_STEPS, INPUT_DIMS))
+ 
+    x = layers.GRU(units=256,activation='hard_sigmoid',recurrent_activation='tanh',name = 'turn_gru1',return_sequences=True)(inputs)  #, padding = 'same'
+    x = Dropout(0.2)(x)
+ 
+
+    attention_mul = attention_3d_block(x)
+    gru_out = layers.GRU(128, activation='hard_sigmoid',recurrent_activation='tanh',name = 'turn_gru2',return_sequences=True)(attention_mul)
+    x = Dropout(0.2)(gru_out)
+    lstm_out = layers.SQLSTM(128,name = 'sq_lstm',return_sequences=True)(x)
+    attention_mul = Flatten()(lstm_out)
+ 
+    output = Dense(1, activation='sigmoid')(attention_mul)
+    model = Model(inputs=[inputs], outputs=output)
+    return model
+    
+    
+m = attention_model()
+  
+  
+m.summary()
+
+
+utils.plot_model(m)
+
+
+# 模型编译
+m.compile(optimizer='adam',
+              loss='mse')
+              
+              
+checkpoint_file = "best_model.hdf5"
+checkpoint_callback = ModelCheckpoint(filepath=checkpoint_file, 
+                                      monitor='loss',
+                                      mode='min',
+                                      save_best_only=True,
+                                      save_weights_only=True)
+                                      
+                                      
+                                      
+# 模型训练
+history = m.fit(train_batch_dataset,
+                    epochs=200,
+                    validation_data=test_batch_dataset,
+                    callbacks=[checkpoint_callback])
+                    
+                    
+plt.figure(figsize=(16,8))
+plt.plot(history.history['loss'], label='train loss')
+plt.plot(history.history['val_loss'], label='val loss')
+plt.legend(loc='best')
+plt.show()
+
+
+test_preds = model.predict(test_dataset, verbose=1)
+
+
+test_preds = test_preds[:, 0] # 获取列值
+test_preds[:10]
+
+
+# 计算r2值
+score = r2_score(test_labels, test_preds)
+print("r^2 值为： ", score)
+
+
+# 绘制 预测与真值结果
+plt.figure(figsize=(16,8))
+plt.plot(test_labels[:300], label="True value")
+plt.plot(test_preds[:300], label="Pred value")
+plt.legend(loc='best')
+plt.show()
+
+
+# calculate MSE 均方误差 ---> E[(预测值-真实值)^2] (预测值减真实值求平方后求均值)
+mse = mean_squared_error(test_preds, test_labels)
+# calculate RMSE 均方根误差--->sqrt[MSE]    (对均方误差开方)
+rmse = math.sqrt(mean_squared_error(test_preds, test_labels))
+
+# calculate MAE 平均绝对误差----->E[|预测值-真实值|](预测值减真实值求绝对值后求均值）
+mae = mean_absolute_error(test_preds, test_labels)
+print('均方误差: %.6f' % mse)
+print('均方根误差: %.6f' % rmse)
+print('平均绝对误差: %.6f' % mae)
